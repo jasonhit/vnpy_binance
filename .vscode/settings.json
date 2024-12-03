@@ -1,0 +1,6 @@
+{
+    "python.analysis.extraPaths": [
+        ".", "../vnpy_evo"
+    ],
+    "python.analysis.indexing": false
+}

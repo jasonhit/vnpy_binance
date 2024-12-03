@@ -3,10 +3,10 @@ import hashlib
 import hmac
 import time
 from copy import copy
-from datetime import datetime, timedelta
 from enum import Enum
-from zoneinfo import ZoneInfo
 from time import sleep
+from datetime import datetime, timedelta
+import json
 
 from numpy import format_float_positional
 
@@ -17,6 +17,7 @@ from vnpy.trader.constant import (
     Product,
     Status,
     OrderType,
+    OptionType,
     Interval
 )
 from vnpy.trader.gateway import BaseGateway
@@ -26,6 +27,7 @@ from vnpy.trader.object import (
     TradeData,
     AccountData,
     ContractData,
+    PositionData,
     BarData,
     OrderRequest,
     CancelRequest,
@@ -33,7 +35,7 @@ from vnpy.trader.object import (
     HistoryRequest
 )
 from vnpy.trader.event import EVENT_TIMER
-from vnpy.trader.utility import round_to
+from vnpy.trader.utility import round_to, ZoneInfo, get_file_path
 from vnpy_evo.rest import Request, RestClient, Response
 from vnpy_evo.websocket import WebsocketClient
 
@@ -42,32 +44,34 @@ from vnpy_evo.websocket import WebsocketClient
 UTC_TZ = ZoneInfo("UTC")
 
 # Real server hosts
-REST_HOST: str = "https://api.binance.com"
-WEBSOCKET_TRADE_HOST: str = "wss://stream.binance.com:9443/ws/"
-WEBSOCKET_DATA_HOST: str = "wss://stream.binance.com:9443/stream"
+O_REST_HOST: str = "https://eapi.binance.com"
+O_WEBSOCKET_TRADE_HOST: str = "wss://nbstream.binance.com/eoptions/ws/"
+O_WEBSOCKET_DATA_HOST: str = "wss://nbstream.binance.com/eoptions/stream"
 
 # Testnet server hosts
-TESTNET_REST_HOST: str = "https://testnet.binance.vision"
-TESTNET_WEBSOCKET_TRADE_HOST: str = "wss://testnet.binance.vision/ws/"
-TESTNET_WEBSOCKET_DATA_HOST: str = "wss://testnet.binance.vision/stream"
+O_TESTNET_REST_HOST: str = "https://testnet.binancefuture.com"
+O_TESTNET_WEBSOCKET_TRADE_HOST: str = "wss://stream.binancefuture.com/ws/"
+O_TESTNET_WEBSOCKET_DATA_HOST: str = "wss://stream.binancefuture.com/stream"
 
 # Order status map
 STATUS_BINANCE2VT: dict[str, Status] = {
     "NEW": Status.NOTTRADED,
+    "ACCEPTED": Status.NOTTRADED,
     "PARTIALLY_FILLED": Status.PARTTRADED,
     "FILLED": Status.ALLTRADED,
-    "CANCELED": Status.CANCELLED,
+    "CANCELLED": Status.CANCELLED,
     "REJECTED": Status.REJECTED,
     "EXPIRED": Status.CANCELLED
 }
 
 # Order type map
-ORDERTYPE_VT2BINANCE: dict[OrderType, str] = {
-    OrderType.LIMIT: "LIMIT",
-    OrderType.MARKET: "MARKET",
-    OrderType.STOP: "STOP_LOSS"
+ORDERTYPE_VT2BINANCE: dict[OrderType, tuple[str, str]] = {
+    OrderType.LIMIT: ("LIMIT", "GTC"),
+    OrderType.MARKET: ("MARKET", "GTC"),
+    OrderType.FAK: ("LIMIT", "IOC"),
+    OrderType.FOK: ("LIMIT", "FOK"),
 }
-ORDERTYPE_BINANCE2VT: dict[str, OrderType] = {v: k for k, v in ORDERTYPE_VT2BINANCE.items()}
+ORDERTYPE_BINANCE2VT: dict[tuple[str, str], OrderType] = {v: k for k, v in ORDERTYPE_VT2BINANCE.items()}
 
 # Direction map
 DIRECTION_VT2BINANCE: dict[Direction, str] = {
@@ -75,6 +79,14 @@ DIRECTION_VT2BINANCE: dict[Direction, str] = {
     Direction.SHORT: "SELL"
 }
 DIRECTION_BINANCE2VT: dict[str, Direction] = {v: k for k, v in DIRECTION_VT2BINANCE.items()}
+
+# 期权类型映射
+OPTION_POLYMARKET2VT: dict[str, OptionType] = {
+    "C": OptionType.CALL,
+    "CALL": OptionType.CALL,
+    "P": OptionType.PUT,
+    "PUT": OptionType.PUT
+}
 
 # Kline interval map
 INTERVAL_VT2BINANCE: dict[Interval, str] = {
@@ -96,21 +108,27 @@ WEBSOCKET_TIMEOUT = 24 * 60 * 60
 
 # Global dict for contract data
 symbol_contract_map: dict[str, ContractData] = {}
+order_id_2_custom_order_id_map: dict[str, str] = {}  # order_id -> custom_order_id
 
+custom_order_id_filename: str = "binance_option_orderId_2_clientOrderId.json"
+custom_order_id_filepath: str = str(get_file_path(custom_order_id_filename))
 
 # Authentication level
 class Security(Enum):
-    NONE = 0
-    SIGNED = 1
-    API_KEY = 2
+    NONE: int = 0
+    SIGNED: int = 1
+    API_KEY: int = 2
 
 
-class BinanceSpotGateway(BaseGateway):
+class BinanceOptionGateway(BaseGateway):
     """
-    The Binance spot trading gateway for VeighNa.
+    The Binance Option trading gateway for VeighNa.
+
+    1. Only support crossed position
+    2. Only support one-way mode
     """
 
-    default_name: str = "BINANCE_SPOT"
+    default_name: str = "BINANCE_OPTION"
 
     default_setting: dict = {
         "API Key": "",
@@ -132,13 +150,15 @@ class BinanceSpotGateway(BaseGateway):
         """
         super().__init__(event_engine, gateway_name)
 
-        self.trade_ws_api: BinanceSpotTradeWebsocketApi = BinanceSpotTradeWebsocketApi(self)
-        self.market_ws_api: BinanceSpotDataWebsocketApi = BinanceSpotDataWebsocketApi(self)
-        self.rest_api: BinanceSpotRestAPi = BinanceSpotRestAPi(self)
+        self.trade_ws_api: BinanceOptionTradeWebsocketApi = BinanceOptionTradeWebsocketApi(self)
+        self.market_ws_api: BinanceOptionDataWebsocketApi = BinanceOptionDataWebsocketApi(self)
+        self.rest_api: BinanceOptionRestApi = BinanceOptionRestApi(self)
 
         self.orders: dict[str, OrderData] = {}
 
-    def connect(self, setting: dict):
+        self.count_timer: int = 0
+
+    def connect(self, setting: dict) -> None:
         """Start server connections"""
         key: str = setting["API Key"]
         secret: str = setting["API Secret"]
@@ -184,7 +204,13 @@ class BinanceSpotGateway(BaseGateway):
 
     def process_timer_event(self, event: Event) -> None:
         """Process timer task"""
+        self.count_timer += 1
+
         self.rest_api.keep_user_stream()
+
+        # 每隔60秒，写入custom_order_id
+        if self.count_timer % 60 == 0:
+            self.rest_api.save_custom_order_id()
 
     def on_order(self, order: OrderData) -> None:
         """Save a copy of order and then push"""
@@ -196,10 +222,10 @@ class BinanceSpotGateway(BaseGateway):
         return self.orders.get(orderid, None)
 
 
-class BinanceSpotRestAPi(RestClient):
-    """币安现货REST API"""
+class BinanceOptionRestApi(RestClient):
+    """The REST API of BinanceOptionGateway"""
 
-    def __init__(self, gateway: BinanceSpotGateway) -> None:
+    def __init__(self, gateway: BinanceOptionGateway) -> None:
         """
         The init method of the api.
 
@@ -207,10 +233,10 @@ class BinanceSpotRestAPi(RestClient):
         """
         super().__init__()
 
-        self.gateway: BinanceSpotGateway = gateway
+        self.gateway: BinanceOptionGateway = gateway
         self.gateway_name: str = gateway.gateway_name
 
-        self.trade_ws_api: BinanceSpotTradeWebsocketApi = self.gateway.trade_ws_api
+        self.trade_ws_api: BinanceOptionTradeWebsocketApi = self.gateway.trade_ws_api
 
         self.key: str = ""
         self.secret: str = ""
@@ -220,7 +246,17 @@ class BinanceSpotRestAPi(RestClient):
         self.time_offset: int = 0
 
         self.order_count: int = 1_000_000
-        self.order_prefix: str = ""
+        self.order_prefix: str = "custom_"
+
+        self.load_custom_order_id()
+
+        # 上次保存order_id_2_custom_order_id_map的数量
+        self.last_count_order_id_2_custom_order_id_map = 0
+    
+    def stop(self) -> None:
+        """Stop the rest api"""
+        super().stop()
+        self.save_custom_order_id()  
 
     def sign(self, request: Request) -> Request:
         """Standard callback for signing a request"""
@@ -259,9 +295,9 @@ class BinanceSpotRestAPi(RestClient):
         request.params = {}
         request.data = {}
 
-        # 添加请求头
+        # Add header to the request
         headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
+            #"Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
             "X-MBX-APIKEY": self.key,
             "Connection": "close"
@@ -287,12 +323,12 @@ class BinanceSpotRestAPi(RestClient):
         self.proxy_host = proxy_host
         self.server = server
 
-        self.order_prefix = datetime.now().strftime("%y%m%d%H%M%S")
+        self.order_count = int(datetime.now().timestamp()) * 1000
 
         if self.server == "REAL":
-            self.init(REST_HOST, proxy_host, proxy_port)
+            self.init(O_REST_HOST, proxy_host, proxy_port)
         else:
-            self.init(TESTNET_REST_HOST, proxy_host, proxy_port)
+            self.init(O_TESTNET_REST_HOST, proxy_host, proxy_port)
 
         self.start()
 
@@ -305,44 +341,132 @@ class BinanceSpotRestAPi(RestClient):
         """Query server time"""
         data: dict = {"security": Security.NONE}
 
-        path: str = "/api/v3/time"
+        path: str = "/eapi/v1/time"
 
-        return self.add_request(
+        self.add_request(
             "GET",
             path,
             callback=self.on_query_time,
             data=data
         )
 
+    def load_custom_order_id(self) -> None:
+        """Load custom order id from file"""
+        global order_id_2_custom_order_id_map
+
+        try:
+            with open(custom_order_id_filepath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                order_id_2_custom_order_id_map = data.get("order_id_2_custom_order_id_map", {})
+            
+            # 计数，用于判断是否需要重新写入
+            self.last_count_order_id_2_custom_order_id_map = len(order_id_2_custom_order_id_map)
+        
+        except Exception as e:
+            self.gateway.write_log(f"{self.gateway_name}, load custom order id failed: {str(e)}")       
+
+    def save_custom_order_id(self) -> None:
+        """Save custom order id to file"""
+        # order_id_2_custom_order_id_map的数量发生改变，才需要重新写入
+        if len(order_id_2_custom_order_id_map) != self.last_count_order_id_2_custom_order_id_map:
+            combined_data = {"order_id_2_custom_order_id_map": order_id_2_custom_order_id_map}
+            with open(custom_order_id_filepath, "w", encoding="utf-8") as f:
+                json.dump(combined_data, f, ensure_ascii=False, indent=4)
+            # 计数，用于判断是否需要重新写入
+            self.last_count_order_id_2_custom_order_id_map = len(order_id_2_custom_order_id_map)
+
     def query_account(self) -> None:
         """Query account balance"""
         data: dict = {"security": Security.SIGNED}
 
+        path: str = "/eapi/v1/account"
+
         self.add_request(
             method="GET",
-            path="/api/v3/account",
+            path=path,
             callback=self.on_query_account,
             data=data
         )
+        self.gateway.write_log(f"{self.gateway_name}, Account balance request sent")
+
+    def query_position(self) -> None:
+        """Query holding positions"""
+        data: dict = {"security": Security.SIGNED}
+
+        path: str = "/eapi/v1/position"
+
+        self.add_request(
+            method="GET",
+            path=path,
+            callback=self.on_query_position,
+            data=data
+        )
+        self.gateway.write_log(f"{self.gateway_name}, Holding positions request sent")
 
     def query_order(self) -> None:
         """Query open orders"""
         data: dict = {"security": Security.SIGNED}
 
+        path: str = "/eapi/v1/openOrders"
+
         self.add_request(
             method="GET",
-            path="/api/v3/openOrders",
+            path=path,
             callback=self.on_query_order,
             data=data
         )
+        self.gateway.write_log(f"{self.gateway_name}, Open orders request sent")
+
+    def query_history_order(self, symbol: str) -> None:
+        """Query history orders(ending status). 默认24 hours 终态的订单，需要指定symbol"""
+        data: dict = {"security": Security.SIGNED}
+        # 24 hours 以内的订单记录, 最多1000条
+        params: dict = {
+            "symbol": symbol,
+            "startTime": int((datetime.now() - timedelta(days=1)).timestamp() * 1000),
+            "limit": 1000
+        }
+
+        path: str = "/eapi/v1/historyOrders"
+
+        self.add_request(
+            method="GET",
+            path=path,
+            callback=self.on_query_order,
+            data=data
+        )
+        self.gateway.write_log(f"{self.gateway_name}, history orders(ending status) request sent")
+    
+    def query_trade(self) -> None:
+        """Query trades"""
+        data: dict = {"security": Security.SIGNED}
+
+        # 24 hours 以内的交易记录, 最多1000条
+        params: dict = {
+            "startTime": int((datetime.now() - timedelta(days=1)).timestamp() * 1000),
+            "limit": 1000
+        }
+
+        path: str = "/eapi/v1/userTrades"
+
+        self.add_request(
+            method="GET",
+            path=path,
+            callback=self.on_query_trade,
+            data=data,
+            params=params
+        )
+        self.gateway.write_log(f"{self.gateway_name}, 24 houres trades request sent")
 
     def query_contract(self) -> None:
         """Query available contracts"""
         data: dict = {"security": Security.NONE}
 
+        path: str = "/eapi/v1/exchangeInfo"
+
         self.add_request(
             method="GET",
-            path="/api/v3/exchangeInfo",
+            path=path,
             callback=self.on_query_contract,
             data=data
         )
@@ -364,24 +488,28 @@ class BinanceSpotRestAPi(RestClient):
         data: dict = {"security": Security.SIGNED}
 
         params: dict = {
-            "symbol": req.symbol.upper(),
+            "symbol": req.symbol,
             "side": DIRECTION_VT2BINANCE[req.direction],
-            "type": ORDERTYPE_VT2BINANCE[req.type],
             "quantity": format_float(req.volume),
-            "newClientOrderId": orderid,
-            "newOrderRespType": "ACK"
+            "clientOrderId": orderid,
         }
 
-        if req.type == OrderType.LIMIT:
-            params["timeInForce"] = "GTC"
-            params["price"] = format_float(req.price)
+        if req.type == OrderType.MARKET:
+            params["type"] = "MARKET"
         elif req.type == OrderType.STOP:
-            params["type"] = "STOP_LOSS"
+            params["type"] = "STOP_MARKET"
             params["stopPrice"] = format_float(req.price)
+        else:
+            order_type, time_condition = ORDERTYPE_VT2BINANCE[req.type]
+            params["type"] = order_type
+            params["timeInForce"] = time_condition
+            params["price"] = format_float(req.price)
+
+        path: str = "/eapi/v1/order"
 
         self.add_request(
             method="POST",
-            path="/api/v3/order",
+            path=path,
             callback=self.on_send_order,
             data=data,
             params=params,
@@ -390,43 +518,50 @@ class BinanceSpotRestAPi(RestClient):
             on_failed=self.on_send_order_failed
         )
 
+        self.gateway.write_log(f"{self.gateway_name}, Send order request sent. data: {order}")
         return order.vt_orderid
 
     def cancel_order(self, req: CancelRequest) -> None:
         """Cancel existing order"""
         data: dict = {"security": Security.SIGNED}
-
         params: dict = {
-            "symbol": req.symbol.upper(),
-            "origClientOrderId": req.orderid
-        }
+                "symbol": req.symbol,
+            }
+        # 如果req.orderid不包括字符串"custom_"，则说明是orderId，要用orderId撤单
+        if "custom_" not in req.orderid:
+            params["orderId"] = req.orderid
+        else:
+            params["clientOrderId"] = req.orderid
+
+        path: str = "/eapi/v1/order"
 
         order: OrderData = self.gateway.get_order(req.orderid)
 
         self.add_request(
             method="DELETE",
-            path="/api/v3/order",
+            path=path,
             callback=self.on_cancel_order,
             params=params,
             data=data,
             on_failed=self.on_cancel_failed,
             extra=order
         )
+        self.gateway.write_log(f"{self.gateway_name}, Cancel order request sent. orderid: {req.orderid}")
 
-        self.gateway.write_log(f"{self.gateway_name}, Cancel order request sent, {req.orderid}")
-
-    def start_user_stream(self) -> Request:
+    def start_user_stream(self) -> None:
         """Create listen key for user stream"""
         data: dict = {"security": Security.API_KEY}
 
+        path: str = "/eapi/v1/listenKey"
+
         self.add_request(
             method="POST",
-            path="/api/v3/userDataStream",
+            path=path,
             callback=self.on_start_user_stream,
             data=data
         )
 
-    def keep_user_stream(self) -> Request:
+    def keep_user_stream(self) -> None:
         """Extend listen key validity"""
         if not self.user_stream_key:
             return
@@ -440,9 +575,11 @@ class BinanceSpotRestAPi(RestClient):
 
         params: dict = {"listenKey": self.user_stream_key}
 
+        path: str = "/eapi/v1/listenKey"
+
         self.add_request(
             method="PUT",
-            path="/api/v3/userDataStream",
+            path=path,
             callback=self.on_keep_user_stream,
             params=params,
             data=data,
@@ -451,62 +588,129 @@ class BinanceSpotRestAPi(RestClient):
 
     def on_query_time(self, data: dict, request: Request) -> None:
         """Callback of server time query"""
-        local_time = int(time.time() * 1000)
-        server_time = int(data["serverTime"])
-        self.time_offset = local_time - server_time
+        local_time: int = int(time.time() * 1000)
+        server_time: int = int(data["serverTime"])
+        self.time_offset: int = local_time - server_time
 
         self.gateway.write_log(f"{self.gateway_name}, Server time updated, local offset: {self.time_offset}ms")
 
         # Query private data after time offset is calculated
         if self.key and self.secret:
             self.query_account()
+            self.query_position()
             self.query_order()
+            self.query_trade()
             self.start_user_stream()
 
     def on_query_account(self, data: dict, request: Request) -> None:
         """Callback of account balance query"""
-        for account_data in data["balances"]:
+        self.gateway.write_log(f"{self.gateway_name}, Rest Account balance data is received. data: {data}")
+        for asset in data["asset"]:
             account: AccountData = AccountData(
-                accountid=account_data["asset"],
-                balance=float(account_data["free"]) + float(account_data["locked"]),
-                frozen=float(account_data["locked"]),
+                accountid=asset["asset"],
+                balance=float(asset["marginBalance"]),
+                frozen=float(asset["locked"]),
                 gateway_name=self.gateway_name
             )
 
-            if account.balance:
-                self.gateway.on_account(account)
+            self.gateway.on_account(account)
 
         self.gateway.write_log(f"{self.gateway_name}, Account balance data is received")
 
-    def on_query_order(self, data: dict, request: Request) -> None:
-        """Callback of open orders query"""
+    def on_query_position(self, data: list, request: Request) -> None:
+        """Callback of holding positions query"""
+        self.gateway.write_log(f"{self.gateway_name}, Rest positions data is received. data: {data}")
         for d in data:
-            if d["type"] not in ORDERTYPE_BINANCE2VT:
+            position: PositionData = PositionData(
+                symbol=d["symbol"],
+                exchange=Exchange.BINANCE,
+                direction=Direction.NET,
+                volume=float(d["quantity"]),
+                price=float(d["markPrice"]),
+                pnl=float(d["unrealizedPNL"]),
+                gateway_name=self.gateway_name,
+            )
+
+            self.gateway.on_position(position)
+
+        self.gateway.write_log(f"{self.gateway_name}, Holding positions data is received")
+
+    def on_query_order(self, data: list, request: Request) -> None:
+        """Callback of open orders query"""
+        self.gateway.write_log(f"{self.gateway_name}, Open orders data is received. data: {data}")
+        for d in data:
+            key: tuple[str, str] = (d["type"], d["timeInForce"])
+            order_type: OrderType = ORDERTYPE_BINANCE2VT.get(key, None)
+            if not order_type:
                 continue
 
+            client_order_id: str = d["clientOrderId"]
+            order_id: str = str(d["orderId"])
+            if not client_order_id:
+                client_order_id = order_id
+            else:
+                order_id_2_custom_order_id_map[order_id] = client_order_id
+
             order: OrderData = OrderData(
-                orderid=d["clientOrderId"],
-                symbol=d["symbol"].lower(),
+                orderid=client_order_id,
+                symbol=d["symbol"],
                 exchange=Exchange.BINANCE,
                 price=float(d["price"]),
-                volume=float(d["origQty"]),
-                type=ORDERTYPE_BINANCE2VT[d["type"]],
+                volume=float(d["quantity"]),
+                type=order_type,
                 direction=DIRECTION_BINANCE2VT[d["side"]],
                 traded=float(d["executedQty"]),
                 status=STATUS_BINANCE2VT.get(d["status"], None),
-                datetime=generate_datetime(d["time"]),
+                datetime=generate_datetime(d["createTime"]),
                 gateway_name=self.gateway_name,
             )
             self.gateway.on_order(order)
 
         self.gateway.write_log(f"{self.gateway_name}, Open orders data is received")
+    
+    def on_query_trade(self, data: list, request: Request) -> None:
+        """Callback of trades query"""
+        # trade data里面，没有clientOrderId，只有orderId，所以要先查history order，然后根据的orderId来映射
+        self.gateway.write_log(f"{self.gateway_name}, Rest 24 hours trades data is received. data: {data}")
+        # data list里面的数据倒序
+        data.reverse()
+        for d in data:
+            qty = d["quantity"]
+            if '.' in qty:
+                qty = float(qty)
+            else:
+                qty = int(qty)
+            
+            # trade里面没有client order id，只能看看之前的order里面有没有
+            order_id = str(d["orderId"])
+            custom_order_id = order_id_2_custom_order_id_map.get(order_id, None)
+            if custom_order_id:
+                order_id = custom_order_id
+            
+            trade: TradeData = TradeData(
+                symbol=d["symbol"],
+                exchange=Exchange.BINANCE,
+                orderid=order_id,
+                tradeid=d["tradeId"],
+                direction=DIRECTION_BINANCE2VT[d["side"]],
+                price=float(d["price"]),
+                volume=qty,
+                datetime=generate_datetime(d["time"]),
+                gateway_name=self.gateway_name,
+            )
+            self.gateway.on_trade(trade)
+
+        self.gateway.write_log(f"{self.gateway_name}, 24 hours trades data is received")
 
     def on_query_contract(self, data: dict, request: Request) -> None:
         """Callback of available contracts query"""
-        for d in data["symbols"]:
-            base_currency: str = d["baseAsset"]
-            quote_currency: str = d["quoteAsset"]
-            name: str = f"{base_currency.upper()}/{quote_currency.upper()}"
+        for d in data["optionSymbols"]:
+            underlying_symbol = d["underlying"]
+            option_type = d["side"]
+            strike_price = d["strikePrice"]
+            expiry_date = generate_datetime(float(d["expiryDate"]))
+            
+            name = f"{underlying_symbol} {expiry_date.strftime('%Y%m%d')} {strike_price} {option_type}"
 
             pricetick: int = 1
             min_volume: int = 1
@@ -518,18 +722,26 @@ class BinanceSpotRestAPi(RestClient):
                     min_volume = float(f["stepSize"])
 
             contract: ContractData = ContractData(
-                symbol=d["symbol"].lower(),
+                symbol=d["symbol"],
                 exchange=Exchange.BINANCE,
                 name=name,
                 pricetick=pricetick,
                 size=1,
                 min_volume=min_volume,
-                product=Product.SPOT,
-                history_data=True,
+                product=Product.OPTION,
                 net_position=True,
+                history_data=True,
                 gateway_name=self.gateway_name,
                 stop_supported=True
             )
+            if contract.product == Product.OPTION:
+                contract.option_portfolio = underlying_symbol + "_O"
+                contract.option_type = OPTION_POLYMARKET2VT.get(option_type, None)
+                contract.option_strike = float(strike_price)
+                contract.option_index = strike_price
+                contract.option_expiry = expiry_date
+                contract.option_underlying = underlying_symbol
+
             self.gateway.on_contract(contract)
 
             symbol_contract_map[contract.symbol] = contract
@@ -538,6 +750,7 @@ class BinanceSpotRestAPi(RestClient):
 
     def on_send_order(self, data: dict, request: Request) -> None:
         """Successful callback of send_order"""
+        self.gateway.write_log(f"{self.gateway_name}, Rest Send order success. data: {data}")
         pass
 
     def on_send_order_failed(self, status_code: str, request: Request) -> None:
@@ -546,7 +759,7 @@ class BinanceSpotRestAPi(RestClient):
         order.status = Status.REJECTED
         self.gateway.on_order(order)
 
-        msg: str = f"{self.gateway_name}, Send order failed, status code: {status_code}, message: {request.response.text}"
+        msg: str = f"{self.gateway_name}, Rest Send order failed, status code: {status_code}, message: {request.response.text}"
         self.gateway.write_log(msg)
 
     def on_send_order_error(self, exception_type: type, exception_value: Exception, tb, request: Request) -> None:
@@ -560,6 +773,7 @@ class BinanceSpotRestAPi(RestClient):
 
     def on_cancel_order(self, data: dict, request: Request) -> None:
         """Successful callback of cancel_order"""
+        self.gateway.write_log(f"{self.gateway_name}, Rest Cancel order success. data: {data}")
         pass
 
     def on_cancel_failed(self, status_code: str, request: Request) -> None:
@@ -572,7 +786,7 @@ class BinanceSpotRestAPi(RestClient):
             self.gateway.on_order(order)
         '''
 
-        msg = f"{self.gateway_name}, Cancel order failed, status code: {status_code}, message: {request.response.text}, order: {request.extra} "
+        msg: str = f"{self.gateway_name}, Rest Cancel orde failed, status code: {status_code}, message: {request.response.text}, order: {request.extra} "
         self.gateway.write_log(msg)
 
     def on_start_user_stream(self, data: dict, request: Request) -> None:
@@ -581,9 +795,9 @@ class BinanceSpotRestAPi(RestClient):
         self.keep_alive_count = 0
 
         if self.server == "REAL":
-            url = WEBSOCKET_TRADE_HOST + self.user_stream_key
+            url = O_WEBSOCKET_TRADE_HOST + self.user_stream_key
         else:
-            url = TESTNET_WEBSOCKET_TRADE_HOST + self.user_stream_key
+            url = O_TESTNET_WEBSOCKET_TRADE_HOST + self.user_stream_key
 
         self.trade_ws_api.connect(url, self.proxy_host, self.proxy_port)
 
@@ -599,25 +813,27 @@ class BinanceSpotRestAPi(RestClient):
     def query_history(self, req: HistoryRequest) -> list[BarData]:
         """Query kline history data"""
         history: list[BarData] = []
-        limit: int = 1000
+        limit: int = 1500
+
         start_time: int = int(datetime.timestamp(req.start))
 
         while True:
             # Create query parameters
             params: dict = {
-                "symbol": req.symbol.upper(),
+                "symbol": req.symbol,
                 "interval": INTERVAL_VT2BINANCE[req.interval],
-                "limit": limit,
-                "startTime": start_time * 1000,
+                "limit": limit
             }
 
+            params["startTime"] = start_time * 1000
+            path: str = "/eapi/v1/klines"
             if req.end:
-                end_time: int = int(datetime.timestamp(req.end))
+                end_time = int(datetime.timestamp(req.end))
                 params["endTime"] = end_time * 1000     # Convert to milliseconds
 
             resp: Response = self.request(
                 "GET",
-                "/api/v3/klines",
+                path=path,
                 data={"security": Security.NONE},
                 params=params
             )
@@ -657,10 +873,10 @@ class BinanceSpotRestAPi(RestClient):
                     }
                     buf.append(bar)
 
-                history.extend(buf)
-
                 begin: datetime = buf[0].datetime
                 end: datetime = buf[-1].datetime
+
+                history.extend(buf)
                 msg: str = f"{self.gateway_name}, Query kline history finished, {req.symbol} - {req.interval.value}, {begin} - {end}"
                 self.gateway.write_log(msg)
 
@@ -685,10 +901,10 @@ class BinanceSpotRestAPi(RestClient):
         return history
 
 
-class BinanceSpotTradeWebsocketApi(WebsocketClient):
-    """The trade websocket API of BinanceSpotGateway"""
+class BinanceOptionTradeWebsocketApi(WebsocketClient):
+    """The trade websocket API of BinanceOptionGateway"""
 
-    def __init__(self, gateway: BinanceSpotGateway) -> None:
+    def __init__(self, gateway: BinanceOptionGateway) -> None:
         """
         The init method of the api.
 
@@ -696,12 +912,10 @@ class BinanceSpotTradeWebsocketApi(WebsocketClient):
         """
         super().__init__()
 
-        self.gateway: BinanceSpotGateway = gateway
+        self.gateway: BinanceOptionGateway = gateway
         self.gateway_name: str = gateway.gateway_name
 
-        self.active_accounts: set[str] = set()
-
-    def connect(self, url: str, proxy_host: int, proxy_port: int) -> None:
+    def connect(self, url: str, proxy_host: str, proxy_port: int) -> None:
         """Start server connection"""
         self.init(url, proxy_host, proxy_port, receive_timeout=WEBSOCKET_TIMEOUT)
         self.start()
@@ -712,9 +926,9 @@ class BinanceSpotTradeWebsocketApi(WebsocketClient):
 
     def on_packet(self, packet: dict) -> None:
         """Callback of data update"""
-        if packet["e"] == "outboundAccountPosition":
+        if packet["e"] == "ACCOUNT_UPDATE":
             self.on_account(packet)
-        elif packet["e"] == "executionReport":
+        elif packet["e"] == "ORDER_TRADE_UPDATE":
             self.on_order(packet)
         elif packet["e"] == "listenKeyExpired":
             self.on_listen_key_expired()
@@ -722,72 +936,115 @@ class BinanceSpotTradeWebsocketApi(WebsocketClient):
     def on_listen_key_expired(self) -> None:
         """Callback of listen key expired"""
         self.gateway.write_log(f"{self.gateway_name}, Listen key is expired")
+        self.disconnect()
 
     def on_account(self, packet: dict) -> None:
-        """Callback of account balance update"""
-        for d in packet["B"]:
+        """Callback of account balance and holding position update"""
+        for acc_data in packet["B"]:
             account: AccountData = AccountData(
-                accountid=d["a"],
-                balance=float(d["f"]) + float(d["l"]),
-                frozen=float(d["l"]),
+                accountid=acc_data["a"],
+                balance=float(acc_data["b"]),
+                frozen=float(acc_data["i"]),
                 gateway_name=self.gateway_name
             )
 
-            if account.balance or account.accountid in self.active_accounts:
-                self.active_accounts.add(account.accountid)
+            if account.balance:
                 self.gateway.on_account(account)
+
+        for pos_data in packet["P"]:
+            volume = pos_data["c"]
+            if '.' in volume:
+                volume = float(volume)
+            else:
+                volume = int(volume)
+
+            position: PositionData = PositionData(
+                symbol=pos_data["s"],
+                exchange=Exchange.BINANCE,
+                direction=Direction.NET,
+                volume=volume,
+                price=float(pos_data["a"]),
+                pnl=float(pos_data["p"]) - volume * float(pos_data["a"]),
+                gateway_name=self.gateway_name,
+            )
+            self.gateway.on_position(position)
 
     def on_order(self, packet: dict) -> None:
         """Callback of order and trade update"""
-        if packet["o"] not in ORDERTYPE_BINANCE2VT:
-            return
+        try:
+            self.gateway.write_log(f"{self.gateway_name}, on_order from websocket: {packet}")
+            ord_datas: dict = packet["o"]
+            for ord_data in ord_datas:
+                key: tuple[str, str] = (ord_data["oty"], ord_data["tif"])
+                order_type: OrderType = ORDERTYPE_BINANCE2VT.get(key, None)
+                if not order_type:
+                    return
+                offset = self.gateway.get_order(ord_data["c"]).offset if self.gateway.get_order(ord_data["c"]) else None
 
-        if packet["C"] == "":
-            orderid: str = packet["c"]
-        else:
-            orderid: str = packet["C"]
+                qty = ord_data["q"]
+                if '.' in qty:
+                    qty = float(qty)
+                else:
+                    qty = int(qty)
+                # 如果qty为正数，则为买入，否则为卖出
+                if qty > 0:
+                    direction = Direction.LONG
+                else:
+                    direction = Direction.SHORT
 
-        offset = self.gateway.get_order(orderid).offset if self.gateway.get_order(orderid) else None
+                # 如果用户的id为空，则用oid作为用户id
+                client_order_id = ord_data["c"]
+                order_id = str(ord_data["oid"])
+                order_id_2_custom_order_id_map[order_id] = client_order_id
+                if not client_order_id:
+                    client_order_id = order_id               
 
-        order: OrderData = OrderData(
-            symbol=packet["s"].lower(),
-            exchange=Exchange.BINANCE,
-            orderid=orderid,
-            type=ORDERTYPE_BINANCE2VT[packet["o"]],
-            direction=DIRECTION_BINANCE2VT[packet["S"]],
-            price=float(packet["p"]),
-            volume=float(packet["q"]),
-            traded=float(packet["z"]),
-            status=STATUS_BINANCE2VT[packet["X"]],
-            datetime=generate_datetime(packet["O"]),
-            gateway_name=self.gateway_name,
-            offset=offset
-        )
+                order: OrderData = OrderData(
+                    symbol=ord_data["s"],
+                    exchange=Exchange.BINANCE,
+                    orderid=client_order_id,
+                    type=order_type,
+                    direction=direction,
+                    price=float(ord_data["p"]),
+                    volume=qty,
+                    traded=float(ord_data["e"]),
+                    status=STATUS_BINANCE2VT[ord_data["S"]],
+                    datetime=generate_datetime(ord_data["T"]),
+                    gateway_name=self.gateway_name,
+                    offset=offset
+                )
 
-        self.gateway.on_order(order)
+                self.gateway.on_order(order)
 
-        # Round trade volume to meet step size
-        trade_volume = float(packet["l"])
-        contract: ContractData = symbol_contract_map.get(order.symbol, None)
-        if contract:
-            trade_volume = round_to(trade_volume, contract.min_volume)
+                # 如存在“fi”字段，则为成交数据
+                if "fi" not in ord_data:
+                    continue
 
-        if not trade_volume:
-            return
+                for trade_data in ord_data["fi"]:
+                    # Round trade volume to meet step size
+                    trade_volume: float = float(trade_data["q"])
+                    contract: ContractData = symbol_contract_map.get(order.symbol, None)
+                    if contract:
+                        trade_volume = round_to(trade_volume, contract.min_volume)
 
-        trade: TradeData = TradeData(
-            symbol=order.symbol,
-            exchange=order.exchange,
-            orderid=order.orderid,
-            tradeid=packet["t"],
-            direction=order.direction,
-            price=float(packet["L"]),
-            volume=trade_volume,
-            datetime=generate_datetime(packet["T"]),
-            gateway_name=self.gateway_name,
-            offset=offset
-        )
-        self.gateway.on_trade(trade)
+                    if not trade_volume:
+                        continue
+
+                    trade: TradeData = TradeData(
+                        symbol=order.symbol,
+                        exchange=order.exchange,
+                        orderid=order.orderid,
+                        tradeid=trade_data["t"],
+                        direction=order.direction,
+                        price=float(trade_data["p"]),
+                        volume=trade_volume,
+                        datetime=generate_datetime(trade_data["T"]),
+                        gateway_name=self.gateway_name,
+                        offset=offset
+                    )
+                    self.gateway.on_trade(trade)
+        except Exception as e:
+            self.gateway.write_log(f"{self.gateway_name}, on_order error: {str(e)}, packet: {packet}")
 
     def on_disconnected(self, status_code: int, msg: str) -> None:
         """Callback when server is disconnected"""
@@ -795,10 +1052,10 @@ class BinanceSpotTradeWebsocketApi(WebsocketClient):
         self.gateway.rest_api.start_user_stream()
 
 
-class BinanceSpotDataWebsocketApi(WebsocketClient):
-    """The data websocket API of BinanceSpotGateway"""
+class BinanceOptionDataWebsocketApi(WebsocketClient):
+    """The data websocket API of BinanceOptionGateway"""
 
-    def __init__(self, gateway: BinanceSpotGateway) -> None:
+    def __init__(self, gateway: BinanceOptionGateway) -> None:
         """
         The init method of the api.
 
@@ -806,11 +1063,12 @@ class BinanceSpotDataWebsocketApi(WebsocketClient):
         """
         super().__init__()
 
-        self.gateway: BinanceSpotGateway = gateway
+        self.gateway: BinanceOptionGateway = gateway
         self.gateway_name: str = gateway.gateway_name
 
         self.ticks: dict[str, TickData] = {}
         self.reqid: int = 0
+        self.kline_stream: bool = False
 
     def connect(
         self,
@@ -823,9 +1081,9 @@ class BinanceSpotDataWebsocketApi(WebsocketClient):
         self.kline_stream = kline_stream
 
         if server == "REAL":
-            self.init(WEBSOCKET_DATA_HOST, proxy_host, proxy_port, receive_timeout=WEBSOCKET_TIMEOUT)
+            self.init(O_WEBSOCKET_DATA_HOST, proxy_host, proxy_port, receive_timeout=WEBSOCKET_TIMEOUT)
         else:
-            self.init(TESTNET_WEBSOCKET_DATA_HOST, proxy_host, proxy_port, receive_timeout=WEBSOCKET_TIMEOUT)
+            self.init(O_TESTNET_WEBSOCKET_DATA_HOST, proxy_host, proxy_port, receive_timeout=WEBSOCKET_TIMEOUT)
 
         self.start()
 
@@ -833,7 +1091,7 @@ class BinanceSpotDataWebsocketApi(WebsocketClient):
         """Callback when server is connected"""
         self.gateway.write_log(f"{self.gateway_name}, Data Websocket API is connected")
 
-        # 重新订阅行情
+        # Resubscribe market data
         if self.ticks:
             channels = []
             for symbol in self.ticks.keys():
@@ -870,15 +1128,15 @@ class BinanceSpotDataWebsocketApi(WebsocketClient):
             gateway_name=self.gateway_name,
         )
         tick.extra = {}
-        self.ticks[req.symbol] = tick
+        self.ticks[req.symbol.upper()] = tick
 
         channels = [
-            f"{req.symbol}@ticker",
-            f"{req.symbol}@depth10"
+            f"{req.symbol.upper()}@ticker",
+            f"{req.symbol.upper()}@depth10"
         ]
 
         if self.kline_stream:
-            channels.append(f"{req.symbol.lower()}@kline_1m")
+            channels.append(f"{req.symbol.upper()}@kline_1m")
 
         req: dict = {
             "method": "SUBSCRIBE",
@@ -900,21 +1158,21 @@ class BinanceSpotDataWebsocketApi(WebsocketClient):
         tick: TickData = self.ticks[symbol]
 
         if channel == "ticker":
-            tick.volume = float(data['v'])
-            tick.turnover = float(data['q'])
+            tick.volume = float(data['V'])
+            tick.turnover = float(data['A'])
             tick.open_price = float(data['o'])
             tick.high_price = float(data['h'])
             tick.low_price = float(data['l'])
             tick.last_price = float(data['c'])
             tick.datetime = generate_datetime(float(data['E']))
         elif channel == "depth10":
-            bids: list = data["bids"]
+            bids: list = data["b"]
             for n in range(min(10, len(bids))):
                 price, volume = bids[n]
                 tick.__setattr__("bid_price_" + str(n + 1), float(price))
                 tick.__setattr__("bid_volume_" + str(n + 1), float(volume))
 
-            asks: list = data["asks"]
+            asks: list = data["a"]
             for n in range(min(10, len(asks))):
                 price, volume = asks[n]
                 tick.__setattr__("ask_price_" + str(n + 1), float(price))
